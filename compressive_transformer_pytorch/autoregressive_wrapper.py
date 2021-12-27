@@ -6,12 +6,17 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
+from entmax import entmax_bisect
+import transformers
+from tqdm import tqdm
 
 # structs
 
 Return = namedtuple('Return', ['loss', 'aux_loss', 'is_last_batch'])
 
 # helper functions
+
+# nucleus
 
 def top_p(logits, thres = 0.9):
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -24,12 +29,28 @@ def top_p(logits, thres = 0.9):
     sorted_logits[sorted_indices_to_remove] = float('-inf')
     return sorted_logits.scatter(1, sorted_indices, sorted_logits)
 
+# topk
+
 def top_k(logits, thres = 0.9):
-    k = int((1 - thres) * logits.shape[-1])
+    k = ceil((1 - thres) * logits.shape[-1])
     val, ind = torch.topk(logits, k)
     probs = torch.full_like(logits, float('-inf'))
     probs.scatter_(1, ind, val)
     return probs
+
+# top_a
+
+def top_a(logits, min_p_pow=2.0, min_p_ratio=0.02):
+    probs = F.softmax(logits, dim=-1)
+    limit = torch.pow(torch.max(probs), min_p_pow) * min_p_ratio
+    logits[probs < limit] = -float("Inf")
+    logits[probs >= limit] = 1
+    return logits
+
+# entmax
+
+ENTMAX_ALPHA = 1.3
+entmax = entmax_bisect
 
 # main class
 
@@ -43,9 +64,10 @@ class AutoregressiveWrapper(nn.Module):
         self.seq_len = net.seq_len
 
     @torch.no_grad()
-    def generate(self, start_tokens, seq_len, eos_token = None, temperature = 1., filter_logits_fn = top_k, filter_thres = 0.9, **kwargs):
+    def generate(self, start_tokens, seq_len, eos_token = None, temperature = 1., filter_logits_fn = top_k, filter_thres = 0.9, repetition_penalty = 1.0, **kwargs):
         was_training = self.net.training
         num_dims = len(start_tokens.shape)
+        logits_processor = transformers.RepetitionPenaltyLogitsProcessor(float(repetition_penalty))
 
         if num_dims == 1:
             start_tokens = start_tokens[None, :]
@@ -77,11 +99,27 @@ class AutoregressiveWrapper(nn.Module):
 
         input_len = out.shape[1]
 
-        for _ in range(seq_len):
-            logits, mem, aux_loss = self.net(out[:, -input_len:], memories = mem, mask = mask[:, -input_len:], **kwargs)
+        for _ in tqdm(range(seq_len)):
+            x = out[:, -input_len:]
+            logits, mem, aux_loss = self.net(x, memories = mem, mask = mask[:, -input_len:], **kwargs)
             logits = logits[:, -1, :]
-            filtered_logits = filter_logits_fn(logits, thres = filter_thres)
-            probs = F.softmax(filtered_logits / temperature, dim=-1)
+            logits = logits_processor(x, logits)
+            
+            if filter_logits_fn in {top_k, top_p}:
+                filtered_logits = filter_logits_fn(logits, thres = filter_thres)
+                probs = F.softmax(filtered_logits / temperature, dim=-1)
+
+            elif filter_logits_fn is top_a:
+                filtered_logits = filter_logits_fn(logits, min_p_pow = min_p_pow, min_p_ratio= min_p_ratio)
+                probs = F.softmax(filtered_logits / temperature, dim=-1)
+
+            elif filter_logits_fn is entmax:
+                probs = entmax(logits / temperature, alpha = ENTMAX_ALPHA, dim=-1)
+
+            elif filter_logits_fn is 'nucleus_entmax':
+                filtered_logits = top_p(logits, thres = filter_thres)
+                probs = entmax(filtered_logits / temperature, alpha=ENTMAX_ALPHA, dim=-1)
+
             sample = torch.multinomial(probs, 1)
 
             # unlike most models, inputs start from sequence length of 1 once full sequence length is filled
