@@ -64,7 +64,7 @@ class AutoregressiveWrapper(nn.Module):
         self.seq_len = net.seq_len
 
     @torch.no_grad()
-    def generate(self, start_tokens, seq_len, eos_token = None, temperature = 1., filter_logits_fn = top_k, filter_thres = 0.9, repetition_penalty = 1.0, **kwargs):
+    def generate(self, start_tokens, seq_len, eos_token = None, temperature = 1., filter_logits_fn = top_k, filter_thres = 0.9, repetition_penalty = 1.0, min_p_pow=2.0, min_p_ratio=0.02, **kwargs):
         was_training = self.net.training
         num_dims = len(start_tokens.shape)
         logits_processor = transformers.RepetitionPenaltyLogitsProcessor(float(repetition_penalty))
