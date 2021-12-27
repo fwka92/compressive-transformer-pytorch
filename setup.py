@@ -17,7 +17,9 @@ setup(
   ],
   install_requires=[
       'torch',
-      'mogrifier'
+      'mogrifier',
+      'entmax',
+      'transformers'
   ],
   classifiers=[
       'Development Status :: 4 - Beta',
